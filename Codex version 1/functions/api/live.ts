@@ -6,7 +6,6 @@ const SUPPORTED_CURRENCIES = ["USD", "PKR", "INR", "GBP", "EUR", "AED", "SAR", "
 const CURRENCY_API_URL = "https://latest.currency-api.pages.dev/v1/currencies/usd.json";
 const FRED_OBSERVATIONS_URL = "https://api.stlouisfed.org/fred/series/observations";
 const GOLD_SERIES_ID = "GOLDAMGBD229NLBM";
-const SILVER_SERIES_ID = "SLVPRUSD";
 const CURRENCY_TTL_MS = 5 * 60 * 1000;
 const BULLION_TTL_MS = 10 * 60 * 1000;
 const TROY_OUNCE_GRAMS = 31.1034768;
@@ -121,18 +120,13 @@ class BullionService {
 
   constructor() {
     const goldUsdPerGram = FALLBACK_BULLION.goldUsdPerGram;
-    const silverUsdPerGram = FALLBACK_BULLION.silverUsdPerGram;
     this.lastGood = {
       gold: {
         usdPerGram: goldUsdPerGram,
         usdPerTroyOunce: goldUsdPerGram * TROY_OUNCE_GRAMS,
         observationDate: "fallback",
       },
-      silver: {
-        usdPerGram: silverUsdPerGram,
-        usdPerTroyOunce: silverUsdPerGram * TROY_OUNCE_GRAMS,
-        observationDate: "fallback",
-      },
+      silver: createFallbackSilverQuote(),
       cacheStatus: "cached",
     };
   }
@@ -146,7 +140,7 @@ class BullionService {
       const payload = await this.fetchFresh(env);
       this.cache = { payload, expiresAt: now + BULLION_TTL_MS };
       this.lastGood = cloneBullionPayload(payload, "cached");
-      return cloneBullionPayload(payload, "fresh");
+      return cloneBullionPayload(payload, payload.cacheStatus);
     } catch (error) {
       console.error("bullion service fetch failed", error);
       return cloneBullionPayload(this.lastGood, "cached");
@@ -157,14 +151,15 @@ class BullionService {
     if (!env.FRED_API_KEY) {
       throw new Error("missing FRED_API_KEY");
     }
-    const [gold, silver] = await Promise.all([
-      this.fetchSeries(env.FRED_API_KEY, GOLD_SERIES_ID),
-      this.fetchSeries(env.FRED_API_KEY, SILVER_SERIES_ID),
-    ]);
+    const gold = await this.fetchSeries(env.FRED_API_KEY, GOLD_SERIES_ID);
+    const silver = this.lastGood?.silver ?? createFallbackSilverQuote();
+    if (silver.observationDate === "fallback") {
+      console.warn("silver price falling back to static value; live source unavailable");
+    }
     const payload: BullionPayload = {
       gold,
       silver,
-      cacheStatus: "fresh",
+      cacheStatus: silver.observationDate === "fallback" ? "cached" : "fresh",
     };
     return payload;
   }
@@ -270,5 +265,14 @@ function cloneBullionPayload(payload: BullionPayload, status: "fresh" | "cached"
     gold: { ...payload.gold },
     silver: { ...payload.silver },
     cacheStatus: status,
+  };
+}
+
+function createFallbackSilverQuote(): BullionQuote {
+  const usdPerGram = FALLBACK_BULLION.silverUsdPerGram;
+  return {
+    usdPerGram,
+    usdPerTroyOunce: usdPerGram * TROY_OUNCE_GRAMS,
+    observationDate: "fallback",
   };
 }
