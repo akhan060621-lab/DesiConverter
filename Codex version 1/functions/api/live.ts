@@ -1,13 +1,11 @@
 interface Env {
-  FRED_API_KEY?: string;
+  BULLION_CSV_URL?: string;
 }
 
 const SUPPORTED_CURRENCIES = ["USD", "PKR", "INR", "GBP", "EUR", "AED", "SAR", "BDT", "NPR"] as const;
 const CURRENCY_API_URL = "https://latest.currency-api.pages.dev/v1/currencies/usd.json";
-const FRED_OBSERVATIONS_URL = "https://api.stlouisfed.org/fred/series/observations";
-const GOLD_SERIES_ID = "GOLDAMGBD229NLBM";
 const CURRENCY_TTL_MS = 5 * 60 * 1000;
-const BULLION_TTL_MS = 10 * 60 * 1000;
+const BULLION_TTL_MS = 12 * 60 * 60 * 1000;
 const TROY_OUNCE_GRAMS = 31.1034768;
 
 const FALLBACK_CURRENCY_RATES: Record<SupportedCurrency, number> = {
@@ -25,6 +23,7 @@ const FALLBACK_CURRENCY_RATES: Record<SupportedCurrency, number> = {
 const FALLBACK_BULLION = {
   goldUsdPerGram: 135.08,
   silverUsdPerGram: 1.7,
+  observationLabel: "fallback",
 };
 
 type SupportedCurrency = (typeof SUPPORTED_CURRENCIES)[number];
@@ -119,16 +118,7 @@ class BullionService {
   private lastGood: BullionPayload;
 
   constructor() {
-    const goldUsdPerGram = FALLBACK_BULLION.goldUsdPerGram;
-    this.lastGood = {
-      gold: {
-        usdPerGram: goldUsdPerGram,
-        usdPerTroyOunce: goldUsdPerGram * TROY_OUNCE_GRAMS,
-        observationDate: "fallback",
-      },
-      silver: createFallbackSilverQuote(),
-      cacheStatus: "cached",
-    };
+    this.lastGood = createFallbackBullionPayload();
   }
 
   async get(env: Env): Promise<BullionPayload> {
@@ -148,57 +138,30 @@ class BullionService {
   }
 
   private async fetchFresh(env: Env): Promise<BullionPayload> {
-    if (!env.FRED_API_KEY) {
-      throw new Error("missing FRED_API_KEY");
+    if (!env.BULLION_CSV_URL) {
+      console.warn("bullion csv url missing; using fallback prices");
+      return createFallbackBullionPayload();
     }
-    const gold = await this.fetchSeries(env.FRED_API_KEY, GOLD_SERIES_ID);
-    const silver = this.lastGood?.silver ?? createFallbackSilverQuote();
-    if (silver.observationDate === "fallback") {
-      console.warn("silver price falling back to static value; live source unavailable");
+
+    const sheet = await fetchBullionSheet(env.BULLION_CSV_URL);
+
+    const gold = sheet.gold ?? this.lastGood.gold ?? createFallbackGoldQuote();
+    if (!sheet.gold) {
+      console.warn("gold price fallback in effect; sheet missing gold row");
     }
-    const payload: BullionPayload = {
+
+    const silver = sheet.silver ?? this.lastGood.silver ?? createFallbackSilverQuote();
+    if (!sheet.silver) {
+      console.warn("silver price fallback in effect; sheet missing silver row");
+    }
+
+    const cacheStatus: "fresh" | "cached" =
+      sheet.gold && sheet.silver ? "fresh" : "cached";
+
+    return {
       gold,
       silver,
-      cacheStatus: silver.observationDate === "fallback" ? "cached" : "fresh",
-    };
-    return payload;
-  }
-
-  private async fetchSeries(apiKey: string, seriesId: string): Promise<BullionQuote> {
-    const url = new URL(FRED_OBSERVATIONS_URL);
-    url.searchParams.set("series_id", seriesId);
-    url.searchParams.set("api_key", apiKey);
-    url.searchParams.set("file_type", "json");
-    url.searchParams.set("sort_order", "desc");
-    url.searchParams.set("limit", "5");
-
-    const res = await fetch(url.toString());
-    if (!res.ok) {
-      let detail: string | undefined;
-      try {
-        detail = await res.text();
-      } catch (error) {
-        detail = (error as Error)?.message;
-      }
-      console.error("fred series fetch error", seriesId, res.status, detail);
-      throw new Error(`fred ${seriesId} ${res.status}`);
-    }
-    const data = (await res.json()) as {
-      observations?: Array<{ value?: string; date?: string }>;
-    };
-    const observation = data.observations?.find((item) => item.value && item.value !== ".") ?? null;
-    if (!observation || !observation.value || !observation.date) {
-      throw new Error(`fred ${seriesId} missing observation`);
-    }
-    const usdPerTroyOunce = Number(observation.value);
-    if (!isFinite(usdPerTroyOunce)) {
-      throw new Error(`fred ${seriesId} invalid value`);
-    }
-    const usdPerGram = usdPerTroyOunce / TROY_OUNCE_GRAMS;
-    return {
-      usdPerTroyOunce,
-      usdPerGram,
-      observationDate: observation.date,
+      cacheStatus,
     };
   }
 }
@@ -268,11 +231,159 @@ function cloneBullionPayload(payload: BullionPayload, status: "fresh" | "cached"
   };
 }
 
+function createFallbackBullionPayload(): BullionPayload {
+  return {
+    gold: createFallbackGoldQuote(),
+    silver: createFallbackSilverQuote(),
+    cacheStatus: "cached",
+  };
+}
+
+function createFallbackGoldQuote(): BullionQuote {
+  const usdPerGram = FALLBACK_BULLION.goldUsdPerGram;
+  return {
+    usdPerGram,
+    usdPerTroyOunce: usdPerGram * TROY_OUNCE_GRAMS,
+    observationDate: FALLBACK_BULLION.observationLabel,
+  };
+}
+
 function createFallbackSilverQuote(): BullionQuote {
   const usdPerGram = FALLBACK_BULLION.silverUsdPerGram;
   return {
     usdPerGram,
     usdPerTroyOunce: usdPerGram * TROY_OUNCE_GRAMS,
-    observationDate: "fallback",
+    observationDate: FALLBACK_BULLION.observationLabel,
   };
+}
+
+async function fetchBullionSheet(url: string): Promise<{ gold?: BullionQuote; silver?: BullionQuote }> {
+  const res = await fetch(url, {
+    headers: {
+      // Disable intermediate caching so Sheets updates propagate predictably
+      "cache-control": "no-cache",
+    },
+  });
+  if (!res.ok) {
+    const detail = await res.text().catch(() => "");
+    console.error("bullion sheet fetch error", res.status, detail);
+    throw new Error(`bullion sheet ${res.status}`);
+  }
+  const text = await res.text();
+  return parseBullionCsv(text);
+}
+
+function parseBullionCsv(csv: string): { gold?: BullionQuote; silver?: BullionQuote } {
+  const lines = csv
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0);
+
+  if (lines.length === 0) {
+    return {};
+  }
+
+  const headers = parseCsvLine(lines[0]).map((value) => value.trim().toLowerCase());
+  const metalIdx = headers.findIndex((value) => value === "metal" || value.includes("metal"));
+  const gramIdx = headers.findIndex((value) => value.includes("usd") && value.includes("gram"));
+  const ounceIdx = headers.findIndex((value) => value.includes("usd") && (value.includes("ounce") || value.includes("oz")));
+  const dateIdx = headers.findIndex((value) => value.includes("date") || value.includes("time") || value.includes("updated"));
+
+  const results: { gold?: BullionQuote; silver?: BullionQuote } = {};
+
+  for (let i = 1; i < lines.length; i++) {
+    const cells = parseCsvLine(lines[i]);
+    if (cells.length === 0) continue;
+
+    const metalRaw = normalizeCell(cells[metalIdx]);
+    if (!metalRaw) continue;
+
+    const normalizedMetal = metalRaw.toLowerCase();
+    const target = normalizedMetal.includes("gold") ? "gold" : normalizedMetal.includes("silver") ? "silver" : null;
+    if (!target) continue;
+
+    const usdPerGramCell = normalizeCell(cells[gramIdx]);
+    const usdPerOunceCell = normalizeCell(cells[ounceIdx]);
+    const observationRaw = normalizeCell(cells[dateIdx]);
+
+    let usdPerGram = parseCurrencyNumber(usdPerGramCell);
+    let usdPerTroyOunce = parseCurrencyNumber(usdPerOunceCell);
+
+    if (usdPerGram == null && usdPerTroyOunce != null) {
+      usdPerGram = usdPerTroyOunce / TROY_OUNCE_GRAMS;
+    } else if (usdPerGram != null && usdPerTroyOunce == null) {
+      usdPerTroyOunce = usdPerGram * TROY_OUNCE_GRAMS;
+    }
+
+    if (usdPerGram == null || usdPerTroyOunce == null) {
+      continue;
+    }
+
+    const observationDate = normalizeObservationDate(observationRaw);
+
+    const quote: BullionQuote = {
+      usdPerGram,
+      usdPerTroyOunce,
+      observationDate,
+    };
+
+    results[target] = quote;
+  }
+
+  return results;
+}
+
+function parseCsvLine(line: string): string[] {
+  const cells: string[] = [];
+  let current = "";
+  let inQuotes = false;
+
+  for (let i = 0; i < line.length; i++) {
+    const char = line[i];
+    if (char === '"') {
+      if (inQuotes && line[i + 1] === '"') {
+        current += '"';
+        i++;
+      } else {
+        inQuotes = !inQuotes;
+      }
+    } else if (char === "," && !inQuotes) {
+      cells.push(current);
+      current = "";
+    } else {
+      current += char;
+    }
+  }
+
+  cells.push(current);
+  return cells.map((cell) => cell.trim());
+}
+
+function normalizeCell(cell?: string): string | null {
+  if (cell == null) return null;
+  const trimmed = cell.trim();
+  return trimmed.length ? trimmed : null;
+}
+
+function parseCurrencyNumber(value: string | null): number | null {
+  if (!value) return null;
+  const cleaned = value.replace(/[^0-9.\-]/g, "");
+  if (!cleaned) return null;
+  const num = Number(cleaned);
+  return Number.isFinite(num) ? num : null;
+}
+
+function normalizeObservationDate(value: string | null): string {
+  if (!value) {
+    return new Date().toISOString();
+  }
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return new Date().toISOString();
+  }
+  const parsed = Date.parse(trimmed);
+  if (Number.isFinite(parsed)) {
+    return new Date(parsed).toISOString();
+  }
+  return trimmed;
 }
