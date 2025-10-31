@@ -2,11 +2,13 @@ interface Env {
   ADMIN_EMAIL: string;
   FROM_EMAIL: string;
   SITE_NAME: string;
+  RESEND_API_KEY: string;
   TURNSTILE_SECRET?: string;
+  EMAIL_DRY_RUN?: string;
   MAILCHANNELS_DRY_RUN?: string;
 }
 
-const MC_ENDPOINT = "https://api.mailchannels.net/tx/v1/send";
+const RESEND_ENDPOINT = "https://api.resend.com/emails";
 
 export const onRequest: PagesFunction<Env> = async (context) => {
   if (context.request.method !== "POST") {
@@ -28,7 +30,7 @@ async function handlePost({ request, env, waitUntil }: Parameters<PagesFunction<
       return new Response("Missing fields", { status: 400 });
     }
 
-    const missingConfig = ["ADMIN_EMAIL", "FROM_EMAIL", "SITE_NAME"].filter(
+    const missingConfig = ["ADMIN_EMAIL", "FROM_EMAIL", "SITE_NAME", "RESEND_API_KEY"].filter(
       (key) => !(env as Record<string, unknown>)[key]
     );
     if (missingConfig.length > 0) {
@@ -39,7 +41,8 @@ async function handlePost({ request, env, waitUntil }: Parameters<PagesFunction<
     const adminEmail = env.ADMIN_EMAIL;
     const fromEmail = env.FROM_EMAIL;
     const siteName = env.SITE_NAME;
-    const dryRun = isTruthy(env.MAILCHANNELS_DRY_RUN);
+    const apiKey = env.RESEND_API_KEY;
+    const dryRun = isTruthy(env.EMAIL_DRY_RUN ?? env.MAILCHANNELS_DRY_RUN);
 
     if (env.TURNSTILE_SECRET && turnstileToken) {
       const passed = await verifyTurnstile(turnstileToken, request, env.TURNSTILE_SECRET);
@@ -57,6 +60,7 @@ async function handlePost({ request, env, waitUntil }: Parameters<PagesFunction<
         replyTo: email,
         fromName: siteName,
         dryRun,
+        apiKey,
       }),
       sendMail({
         to: email,
@@ -66,6 +70,7 @@ async function handlePost({ request, env, waitUntil }: Parameters<PagesFunction<
         replyTo: adminEmail,
         fromName: siteName,
         dryRun,
+        apiKey,
       }),
     ]);
 
@@ -100,6 +105,7 @@ async function sendMail({
   replyTo,
   fromName,
   dryRun,
+  apiKey,
 }: {
   to: string;
   from: string;
@@ -108,31 +114,36 @@ async function sendMail({
   replyTo?: string;
   fromName?: string;
   dryRun?: boolean;
+  apiKey: string;
 }) {
+  const fromHeader = fromName ? `${fromName} <${from}>` : from;
   const payload: Record<string, unknown> = {
-    personalizations: [{ to: [{ email: to }] }],
-    from: { email: from, name: fromName || "Desi Converter" },
+    from: fromHeader,
+    to,
     subject,
-    content: [{ type: "text/plain", value: text }],
+    text,
   };
   if (replyTo) {
-    payload.reply_to = { email: replyTo };
+    payload.reply_to = replyTo;
   }
 
   if (dryRun) {
-    console.info("MailChannels dry run payload", payload);
+    console.info("Resend dry run payload", payload);
     return;
   }
 
-  const res = await fetch(MC_ENDPOINT, {
+  const res = await fetch(RESEND_ENDPOINT, {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers: {
+      "content-type": "application/json",
+      Authorization: `Bearer ${apiKey}`,
+    },
     body: JSON.stringify(payload),
   });
   if (!res.ok) {
     const detail = await res.text();
-    console.error("MailChannels error response", res.status, detail);
-    throw new Error(`MailChannels ${res.status}: ${detail}`);
+    console.error("Resend error response", res.status, detail);
+    throw new Error(`Resend ${res.status}: ${detail}`);
   }
 }
 
