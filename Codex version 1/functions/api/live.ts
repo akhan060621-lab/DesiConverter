@@ -262,7 +262,9 @@ async function fetchBullionSheet(url: string): Promise<{ gold?: BullionQuote; si
     headers: {
       // Disable intermediate caching so Sheets updates propagate predictably
       "cache-control": "no-cache",
+      "user-agent": "desiconverter-bullion-feed/1.0",
     },
+    redirect: "follow",
   });
   if (!res.ok) {
     const detail = await res.text().catch(() => "");
